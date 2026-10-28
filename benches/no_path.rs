@@ -2,11 +2,6 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use glam::Vec2;
 use polyanya::{Mesh, PolyanyaFile};
 
-#[cfg(not(feature = "detailed-layers"))]
-const SUFFIX: &str = "";
-#[cfg(feature = "detailed-layers")]
-const SUFFIX: &str = " (detailed-layers)";
-
 fn no_path(c: &mut Criterion) {
     let mesh: Mesh = PolyanyaFile::from_file("meshes/v2/aurora-merged.mesh")
         .try_into()
@@ -21,7 +16,7 @@ fn no_path(c: &mut Criterion) {
     ]
     .iter()
     .for_each(|(from, to)| {
-        c.bench_function(&format!("no path {from:?}-{to:?}{SUFFIX}"), |b| {
+        c.bench_function(&format!("no path {from:?}-{to:?}"), |b| {
             b.iter(|| {
                 assert_eq!(black_box(mesh.path(*from, *to)), None);
             })

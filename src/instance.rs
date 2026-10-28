@@ -84,21 +84,10 @@ pub(crate) struct SearchInstance<'m> {
     pub(crate) path_arena: Vec<PathArenaNode>,
     pub(crate) from: (Vec2, u8),
     pub(crate) to: Vec2,
-    /// A polygon that counts as the goal, and the ones after it.
-    ///
-    /// A 2D point over overlapping polygons has more than one reading, and any of them
-    /// ends the search. One search over all of them beats one search each: they share a
-    /// queue, so the first goal reached is the closest one. There is almost always just
-    /// the one, and the test for it sits in the hot loop, so it is kept out of the list.
+    pub(crate) polygon_from: u32,
     pub(crate) polygon_to: u32,
-    pub(crate) other_polygons_to: Vec<u32>,
     pub(crate) mesh: &'m Mesh,
     pub(crate) blocked_layers: HashSet<u8>,
-    /// The cheapest a unit of travel can be on this mesh: the smallest component of any
-    /// layer's `scale`. The heuristic is measured at this rate so that it stays a lower
-    /// bound however the path ends up routed. See [`SearchInstance::add_node`].
-    #[cfg(feature = "detailed-layers")]
-    pub(crate) min_scale: f32,
     #[cfg(feature = "stats")]
     pub(crate) start: Instant,
     #[cfg(feature = "stats")]
@@ -242,11 +231,14 @@ impl U32Layer for u32 {
 impl<'m> SearchInstance<'m> {
     pub(crate) fn setup(
         mesh: &'m Mesh,
-        from: (Vec2, &[u32]),
-        to: (Vec2, &[u32]),
+        from: (Vec2, u32),
+        to: (Vec2, u32),
         blocked_layers: HashSet<u8>,
         #[cfg(feature = "stats")] start: Instant,
     ) -> Self {
+        let starting_polygon =
+            &mesh.layers[from.1.layer() as usize].polygons[from.1.polygon() as usize];
+
         let mut search_instance = SearchInstance {
             queue: BinaryHeap::with_capacity(15),
             node_buffer: Vec::with_capacity(10),
@@ -262,14 +254,12 @@ impl<'m> SearchInstance<'m> {
                 .min(STALL_LIMIT) as u32,
             recording: false,
             path_arena: Vec::with_capacity(50),
-            from: (from.0, from.1.first().map_or(0, |polygon| polygon.layer())),
+            from: (from.0, from.1.layer()),
             to: to.0,
-            polygon_to: to.1.first().copied().unwrap_or(u32::MAX),
-            other_polygons_to: to.1.iter().skip(1).copied().collect(),
+            polygon_to: to.1,
+            polygon_from: from.1,
             mesh,
             blocked_layers,
-            #[cfg(feature = "detailed-layers")]
-            min_scale: mesh.min_scale(),
             #[cfg(feature = "stats")]
             start,
             #[cfg(feature = "stats")]
@@ -289,85 +279,60 @@ impl<'m> SearchInstance<'m> {
         };
         search_instance.root_history.insert(Root(from.0), 0.0);
 
-        for from_polygon in from.1 {
-            // The polygon the search starts in is not reached over an edge, so nothing
-            // would put it in the path. Seed the arena with it instead, and every path
-            // built from these nodes starts where it actually started.
-            let origin = search_instance.path_arena.len() as u32;
-            search_instance.path_arena.push(PathArenaNode {
-                root: from.0,
-                polygon: *from_polygon,
-                parent: u32::MAX,
-                root_changed: false,
-                // Never read: this entry's layer is the one the path starts in, so the
-                // reconstruction never sees a layer change on it.
-                #[cfg(feature = "detailed-layers")]
-                interval: (from.0, from.0),
-            });
+        let empty_node = SearchNode {
+            arena_parent: u32::MAX,
+            root: from.0,
+            interval: (Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0)),
+            edge: (0, 0),
+            polygon_from: from.1,
+            polygon_to: from.1,
+            previous_polygon_layer: from.1.layer(),
+            distance_start_to_root: 0.0,
+            heuristic: 0.0,
+        };
 
-            let empty_node = SearchNode {
-                arena_parent: origin,
-                root: from.0,
-                interval: (Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0)),
-                edge: (0, 0),
-                polygon_from: *from_polygon,
-                polygon_to: *from_polygon,
-                previous_polygon_layer: from_polygon.layer(),
-                distance_start_to_root: 0.0,
-                heuristic: 0.0,
+        let from_layer = &mesh.layers[from.1.layer() as usize];
+
+        for [edge0, edge1] in starting_polygon.edges_index() {
+            let start = if let Some(v) = from_layer.vertices.get(edge0 as usize) {
+                v
+            } else {
+                continue;
             };
+            let end = if let Some(v) = from_layer.vertices.get(edge1 as usize) {
+                v
+            } else {
+                continue;
+            };
+            let other_side = start
+                .polygons
+                .iter()
+                .find(|i| **i != u32::MAX && **i != from.1 && end.polygons.contains(*i))
+                .unwrap_or(&u32::MAX);
 
-            let from_layer = &mesh.layers[from_polygon.layer() as usize];
-            let starting_polygon = &from_layer.polygons[from_polygon.polygon() as usize];
+            if search_instance.blocked_layers.contains(&other_side.layer()) {
+                continue;
+            }
 
-            for [edge0, edge1] in starting_polygon.edges_index() {
-                let start = if let Some(v) = from_layer.vertices.get(edge0 as usize) {
-                    v
-                } else {
-                    continue;
-                };
-                let end = if let Some(v) = from_layer.vertices.get(edge1 as usize) {
-                    v
-                } else {
-                    continue;
-                };
-                let other_side = start
-                    .polygons
-                    .iter()
-                    .find(|i| **i != u32::MAX && **i != *from_polygon && end.polygons.contains(*i))
-                    .unwrap_or(&u32::MAX);
-
-                if search_instance.is_blocked(other_side.layer()) {
-                    continue;
-                }
-
-                if search_instance.is_goal(*other_side)
-                    || (other_side != &u32::MAX
-                        && !search_instance.mesh.layers[other_side.layer() as usize]
-                            .polygons
-                            .get(other_side.polygon() as usize)
-                            .unwrap()
-                            .is_one_way)
-                {
-                    search_instance.add_node(
-                        from.0,
-                        *other_side,
-                        (start.coords + from_layer.offset, edge0),
-                        (end.coords + from_layer.offset, edge1),
-                        &empty_node,
-                    );
-                }
+            if other_side == &to.1
+                || (other_side != &u32::MAX
+                    && !search_instance.mesh.layers[other_side.layer() as usize]
+                        .polygons
+                        .get(other_side.polygon() as usize)
+                        .unwrap()
+                        .is_one_way)
+            {
+                search_instance.add_node(
+                    from.0,
+                    *other_side,
+                    (start.coords + from_layer.offset, edge0),
+                    (end.coords + from_layer.offset, edge1),
+                    &empty_node,
+                );
             }
         }
         search_instance.flush_nodes();
         search_instance
-    }
-
-    /// Does reaching this polygon end the search?
-    #[inline(always)]
-    pub(crate) fn is_goal(&self, polygon: u32) -> bool {
-        polygon == self.polygon_to
-            || (!self.other_polygons_to.is_empty() && self.other_polygons_to.contains(&polygon))
     }
 
     pub(crate) fn next(&mut self) -> InstanceStep {
@@ -419,12 +384,17 @@ impl<'m> SearchInstance<'m> {
                 return InstanceStep::Continue;
             }
 
-            if self.is_goal(next.polygon_to) {
+            if next.polygon_to == self.polygon_to {
                 #[cfg(feature = "stats")]
                 {
+                    if self.mesh.scenarios.get() == 0 {
+                        eprintln!(
+                        "index;micros;successor_calls;generated;pushed;popped;pruned_post_pop;length",
+                    );
+                    }
                     eprintln!(
                         "{};{};{};{};{};{};{};{}",
-                        self.mesh.scenarios.next(),
+                        self.mesh.scenarios.get(),
                         self.start.elapsed().as_secs_f32() * 1_000_000.0,
                         self.successors_called,
                         self.nodes_generated,
@@ -433,9 +403,11 @@ impl<'m> SearchInstance<'m> {
                         self.nodes_pruned_post_pop,
                         next.distance_start_to_root + next.heuristic,
                     );
+                    self.mesh.scenarios.set(self.mesh.scenarios.get() + 1);
                 }
                 // Reconstruct path and polygons from arena
-                let (mut path, path_through_polygons) = self.reconstruct_path(next.arena_parent);
+                let (mut path, mut path_through_polygons) =
+                    self.reconstruct_path(next.arena_parent);
 
                 #[cfg(feature = "detailed-layers")]
                 let arena_path_with_layers = self.reconstruct_path_with_layers(next.arena_parent);
@@ -445,7 +417,7 @@ impl<'m> SearchInstance<'m> {
                     path.push(turn);
                     path_with_layers_end.push((turn, next.polygon_to.layer()));
                 }
-                let complete = self.is_goal(next.polygon_to);
+                let complete = next.polygon_to == self.polygon_to;
                 if complete {
                     path.push(self.to);
                     path_with_layers_end.push((self.to, next.polygon_to.layer()));
@@ -490,6 +462,8 @@ impl<'m> SearchInstance<'m> {
                     path_with_layers
                 };
 
+                path_through_polygons.insert(0, self.polygon_from);
+
                 return InstanceStep::Found(Path {
                     #[cfg(not(feature = "detailed-layers"))]
                     // Measured over the path that is actually returned, not as
@@ -509,13 +483,7 @@ impl<'m> SearchInstance<'m> {
                     path,
                     #[cfg(feature = "detailed-layers")]
                     length: {
-                        let start = (
-                            self.from.0,
-                            path_through_polygons
-                                .first()
-                                .map_or(self.from.1, |polygon| polygon.layer()),
-                        );
-                        let a = path_with_layers.iter().fold((0.0, start), |acc, p| {
+                        let a = path_with_layers.iter().fold((0.0, self.from), |acc, p| {
                             let scale = self.mesh.layers[acc.1 .1 as usize].scale;
                             let to_point = (acc.1 .0 * scale).distance(p.0 * scale);
                             (acc.0 + to_point, *p)
@@ -575,23 +543,14 @@ impl<'m> SearchInstance<'m> {
         chain.reverse();
 
         let mut result = Vec::new();
-        // The layer the path is travelling in when it reaches an entry is the layer of the
-        // polygon the previous entry stepped into. The chain starts on the seeded entry for
-        // the polygon the search started in, so that one gives the layer to start from.
-        let Some(&origin) = chain.first() else {
-            return result;
-        };
-        let mut previous_layer = self.path_arena[origin as usize].polygon.layer();
         for &arena_idx in &chain {
             let entry = &self.path_arena[arena_idx as usize];
-            if entry.root_changed {
-                result.push((entry.root, entry.root, previous_layer));
+            if let Some(info) = entry.root_layer_info {
+                result.push(info);
             }
-            let layer = entry.polygon.layer();
-            if layer != previous_layer {
-                result.push((entry.interval.0, entry.interval.1, layer));
+            if let Some(info) = entry.crossing_layer_info {
+                result.push(info);
             }
-            previous_layer = layer;
         }
         result
     }
@@ -1035,12 +994,9 @@ impl<'m> SearchInstance<'m> {
             }
             #[cfg(feature = "detailed-layers")]
             {
-                // Both ends scaled by the layer the segment runs through, so this is a
-                // length in that layer's space. Scaling only one end, as this used to,
-                // is not a distance in any space and is not even offset-invariant.
-                new_f += ((root - node.root)
-                    * self.mesh.layers[node.polygon_to.layer() as usize].scale)
-                    .length();
+                new_f += node
+                    .root
+                    .distance(root * self.mesh.layers[node.polygon_to.layer() as usize].scale);
             }
         }
 
@@ -1051,12 +1007,14 @@ impl<'m> SearchInstance<'m> {
         }
         #[cfg(feature = "detailed-layers")]
         {
-            // Every point in raw coordinates, then scaled by the cheapest a unit of travel
-            // can be anywhere on this mesh. No path can beat that rate, so this never
-            // overestimates, which is what lets the search stop at the first goal it pops.
-            // Mixing scaled interval ends with a raw root and goal, as this used to, is not
-            // a bound on anything.
-            heuristic_to_end = heuristic(root, self.to, (start.0, end.0)) * self.min_scale;
+            heuristic_to_end = heuristic(
+                root,
+                self.to,
+                (
+                    start.0 * self.mesh.layers[start.1.layer() as usize].scale,
+                    end.0 * self.mesh.layers[end.1.layer() as usize].scale,
+                ),
+            );
         }
         if new_f.is_nan() || heuristic_to_end.is_nan() {
             #[cfg(debug_assertions)]
@@ -1076,7 +1034,17 @@ impl<'m> SearchInstance<'m> {
             parent: node.arena_parent,
             root_changed,
             #[cfg(feature = "detailed-layers")]
-            interval: (start.0, end.0),
+            root_layer_info: if root_changed {
+                Some((root, root, node.polygon_to.layer()))
+            } else {
+                None
+            },
+            #[cfg(feature = "detailed-layers")]
+            crossing_layer_info: if other_side.layer() != node.polygon_to.layer() {
+                Some((start.0, end.0, other_side.layer()))
+            } else {
+                None
+            },
         });
 
         let new_node = SearchNode {
@@ -1122,30 +1090,6 @@ impl<'m> SearchInstance<'m> {
                 self.node_buffer.push(new_node);
             }
         }
-    }
-
-    /// The `f` of the cheapest node still queued, or `None` if the queue is empty.
-    ///
-    /// `f` never overestimates, so nothing still in the queue can produce a path shorter
-    /// than this. Once a complete path that short has been found, the search is done.
-    #[cfg(feature = "detailed-layers")]
-    #[inline(always)]
-    pub(crate) fn queued_lower_bound(&self) -> Option<f32> {
-        self.queue
-            .peek()
-            .map(|node| node.distance_start_to_root + node.heuristic)
-    }
-
-    /// Does this search block any layer at all?
-    #[inline(always)]
-    fn has_blocked_layers(&self) -> bool {
-        !self.blocked_layers.is_empty()
-    }
-
-    /// Is this layer blocked for this search?
-    #[inline(always)]
-    fn is_blocked(&self, layer: u8) -> bool {
-        self.has_blocked_layers() && self.blocked_layers.contains(&layer)
     }
 
     /// Has this node already been expanded? The key holds everything the expansion reads:
@@ -1213,10 +1157,6 @@ impl<'m> SearchInstance<'m> {
         // push and a pop.
         const MAX_CHAINED_EXPANSIONS: u32 = 64;
         let mut chained_expansions = 0;
-        // Read once. A search never gains a goal, but `self` is borrowed mutably below, so
-        // the compiler has to reload it on every edge otherwise, and this loop is the
-        // hottest thing in the crate.
-        let has_other_goals = !self.other_polygons_to.is_empty();
         loop {
             #[cfg(feature = "stats")]
             {
@@ -1279,7 +1219,7 @@ impl<'m> SearchInstance<'m> {
                     continue;
                 }
 
-                if self.is_blocked(other_side.layer()) {
+                if self.blocked_layers.contains(&other_side.layer()) {
                     #[cfg(debug_assertions)]
                     if self.debug {
                         println!("x blocked layer");
@@ -1289,14 +1229,10 @@ impl<'m> SearchInstance<'m> {
                 }
 
                 // prune edges that only lead to one other polygon, and not the target: dead end pruning
-                // `is_one_way` first: it is false for almost every polygon, so the goal
-                // test -- which is only there to stop the goal itself being pruned -- is
-                // not paid on the edges that do not need it.
-                if self.mesh.layers[other_side.layer() as usize].polygons
-                    [other_side.polygon() as usize]
-                    .is_one_way
-                    && !(*other_side == self.polygon_to
-                        || (has_other_goals && self.other_polygons_to.contains(other_side)))
+                if &self.polygon_to != other_side
+                    && self.mesh.layers[other_side.layer() as usize].polygons
+                        [other_side.polygon() as usize]
+                        .is_one_way
                 {
                     #[cfg(debug_assertions)]
                     if self.debug {
@@ -1333,11 +1269,10 @@ impl<'m> SearchInstance<'m> {
                             .get(node.edge.0 as usize)
                             .unwrap();
                         if (vertex.is_corner
-                            || (self.has_blocked_layers()
-                                && vertex
-                                    .polygons
-                                    .iter()
-                                    .any(|p| *p == u32::MAX || self.is_blocked(p.layer()))))
+                            || (!self.blocked_layers.is_empty()
+                                && vertex.polygons.iter().any(|p| {
+                                    *p == u32::MAX || self.blocked_layers.contains(&p.layer())
+                                })))
                             && lands_on(
                                 node.interval.0,
                                 vertex.coords
@@ -1372,11 +1307,10 @@ impl<'m> SearchInstance<'m> {
                             .get(node.edge.1 as usize)
                             .unwrap();
                         if (vertex.is_corner
-                            || (self.has_blocked_layers()
-                                && vertex
-                                    .polygons
-                                    .iter()
-                                    .any(|p| *p == u32::MAX || self.is_blocked(p.layer()))))
+                            || (!self.blocked_layers.is_empty()
+                                && vertex.polygons.iter().any(|p| {
+                                    *p == u32::MAX || self.blocked_layers.contains(&p.layer())
+                                })))
                             && lands_on(
                                 node.interval.1,
                                 vertex.coords
@@ -1418,7 +1352,7 @@ impl<'m> SearchInstance<'m> {
                 );
             }
 
-            if self.node_buffer.len() == 1 && !self.is_goal(self.node_buffer[0].polygon_to) {
+            if self.node_buffer.len() == 1 && self.node_buffer[0].polygon_to != self.polygon_to {
                 #[cfg(feature = "verbose")]
                 for new_node in &self.node_buffer {
                     println!(

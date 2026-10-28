@@ -14,22 +14,18 @@
 
 const PRECISION: f32 = 1000.0;
 
+#[cfg(feature = "stats")]
+use std::{cell::Cell, time::Instant};
 use std::{
     cmp::Ordering,
     collections::HashSet,
     fmt::{self, Debug, Display},
 };
-#[cfg(feature = "stats")]
-use std::{
-    sync::atomic::{AtomicU32, Ordering as AtomicOrdering},
-    time::Instant,
-};
 
-use glam::{Vec2, Vec3, Vec3Swizzles};
+use glam::{FloatExt, Vec2, Vec3, Vec3Swizzles};
 
 use helpers::{line_intersect_segment, Vec2Helper, EPSILON};
 use instance::{InstanceStep, U32Layer};
-use smallvec::SmallVec;
 use thiserror::Error;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -53,7 +49,7 @@ pub use async_helpers::FuturePath;
 pub use geo;
 pub use input::polyanya_file::PolyanyaFile;
 #[cfg(feature = "recast")]
-pub use input::recast::{RecastError, RecastFullMesh, RecastPolyMesh, RecastPolyMeshDetail};
+pub use input::recast::{RecastFullMesh, RecastPolyMesh, RecastPolyMeshDetail};
 pub use input::triangulation::Triangulation;
 pub use input::trimesh::Trimesh;
 pub use layers::Layer;
@@ -80,19 +76,7 @@ impl Path {
     /// Returns the path with height information on the Y axis.
     ///
     /// This can add points to the path when needed to follow the terrain height.
-    ///
-    /// Returns `None` if any of the layers the path goes through doesn't have height
-    /// information, as there is nothing to follow then. Only some navmesh sources carry
-    /// heights: a mesh built from a [`Triangulation`] is flat, one imported from recast gets
-    /// them from its detail mesh. See [`Layer::heights`] and [`Layer::set_heights`].
-    pub fn path_with_height(&self, start: Vec3, end: Vec3, mesh: &Mesh) -> Option<Vec<Vec3>> {
-        if self.path_through_polygons.iter().any(|polygon_index| {
-            mesh.layers[polygon_index.layer() as usize]
-                .heights()
-                .is_none()
-        }) {
-            return None;
-        }
+    pub fn path_with_height(&self, start: Vec3, end: Vec3, mesh: &Mesh) -> Vec<Vec3> {
         let mut heighted_path = Vec::with_capacity(self.path.len());
         let mut current = start;
         let mut next_i = 0;
@@ -109,13 +93,7 @@ impl Path {
                 break;
             }
         }
-        // The first waypoint should be in one of the polygons the path goes through. If it
-        // somehow isn't, it has no polygon to take a height from and stays on the ground.
-        let mut next = next_coords.position_with_height(mesh).unwrap_or(Vec3::new(
-            next_coords.pos.x,
-            0.0,
-            next_coords.pos.y,
-        ));
+        let mut next = next_coords.position_with_height(mesh);
         for (step, polygon_index) in self
             .path_through_polygons
             .iter()
@@ -145,15 +123,14 @@ impl Path {
                         break;
                     }
                 }
-                next = next_coords.position_with_height(mesh)?;
+                next = next_coords.position_with_height(mesh);
             }
-            let heights = layer.heights()?;
             let v0 = polygon.vertices[0] as usize;
-            let a = layer.vertices[v0].coords.extend(heights[v0]).xzy();
+            let a = layer.vertices[v0].coords.extend(layer.height[v0]).xzy();
             let v1 = polygon.vertices[1] as usize;
-            let b = layer.vertices[v1].coords.extend(heights[v1]).xzy();
+            let b = layer.vertices[v1].coords.extend(layer.height[v1]).xzy();
             let v2 = polygon.vertices[2] as usize;
-            let c = layer.vertices[v2].coords.extend(heights[v2]).xzy();
+            let c = layer.vertices[v2].coords.extend(layer.height[v2]).xzy();
             let polygon_normal = (b - a).cross(c - a);
             let path_direction = next - current;
             if path_direction.dot(polygon_normal).abs() > EPSILON {
@@ -176,7 +153,7 @@ impl Path {
                             layer: Some(polygon_index.layer()),
                             polygon_index: *polygon_index,
                         }
-                        .position_with_height(mesh)?;
+                        .position_with_height(mesh);
                         heighted_path.push(new);
                         current = new;
                     }
@@ -184,7 +161,7 @@ impl Path {
             }
         }
         heighted_path.push(end);
-        Some(heighted_path)
+        heighted_path
     }
 
     /// Returns the polygons that the path goes through.
@@ -207,34 +184,7 @@ pub struct Mesh {
     /// Number of steps before stopping searching for a point in a mesh
     pub search_steps: u32,
     #[cfg(feature = "stats")]
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) scenarios: ScenarioCounter,
-}
-
-/// Counts the paths searched on a [`Mesh`] to index their stats, without making it `!Sync`.
-#[cfg(feature = "stats")]
-#[derive(Debug, Default)]
-pub(crate) struct ScenarioCounter(AtomicU32);
-
-#[cfg(feature = "stats")]
-impl ScenarioCounter {
-    /// Index of the next scenario, printing the stats header before the first one.
-    pub(crate) fn next(&self) -> u32 {
-        let index = self.0.fetch_add(1, AtomicOrdering::Relaxed);
-        if index == 0 {
-            eprintln!(
-                "index;micros;successor_calls;generated;pushed;popped;pruned_post_pop;length"
-            );
-        }
-        index
-    }
-}
-
-#[cfg(feature = "stats")]
-impl Clone for ScenarioCounter {
-    fn clone(&self) -> Self {
-        Self(AtomicU32::new(self.0.load(AtomicOrdering::Relaxed)))
-    }
+    pub(crate) scenarios: Cell<u32>,
 }
 
 /// A point in the navigation mesh
@@ -256,22 +206,6 @@ impl From<Vec2> for Coords {
     fn from(value: Vec2) -> Self {
         Coords {
             pos: value,
-            layer: None,
-            polygon_index: u32::MAX,
-        }
-    }
-}
-
-/// The navigation mesh lies in the XZ plane, with Y as the height, so a [`Vec3`] keeps its
-/// `x` and `z` and drops its `y`.
-///
-/// The height is dropped, not used: on a mesh with overlapping layers this can't tell the
-/// balcony from the floor below it. Use [`Mesh::get_closest_point_at_height`] to pick by
-/// height, or [`Mesh::path_3d`], which does.
-impl From<Vec3> for Coords {
-    fn from(value: Vec3) -> Self {
-        Coords {
-            pos: value.xz(),
             layer: None,
             polygon_index: u32::MAX,
         }
@@ -311,18 +245,12 @@ impl Coords {
         self.polygon_index
     }
 
-    /// Height of this point on the Y axis, interpolated from the heights of the polygon it is in.
-    ///
-    /// Returns `None` if this point isn't in a polygon, or if the layer it is in doesn't have
-    /// height information. Only some navmesh sources carry heights: a mesh built from a
-    /// [`Triangulation`] is flat, one imported from recast gets them from its detail mesh. See
-    /// [`Layer::heights`] and [`Layer::set_heights`].
-    pub fn height(&self, mesh: &Mesh) -> Option<f32> {
+    /// Height of this point
+    pub fn height(&self, mesh: &Mesh) -> f32 {
         if self.polygon_index == u32::MAX {
-            return None;
+            return 0.0;
         }
         let layer = &mesh.layers[self.layer().unwrap_or(0) as usize];
-        let heights = layer.heights()?;
         let poly = &layer.polygons[self.polygon_index.polygon() as usize];
 
         if let Some([segment0, segment1]) = poly.edges_index().find(|[edge0, edge1]| {
@@ -336,26 +264,20 @@ impl Coords {
                 layer.vertices[segment1 as usize].coords,
             );
             let t = (self.pos - a).dot(b - a) / (b - a).dot(b - a);
-            let (h0, h1) = (heights[segment0 as usize], heights[segment1 as usize]);
-            return Some(h0 + (h1 - h0) * t);
+            return layer.height[segment0 as usize].lerp(layer.height[segment1 as usize], t);
         }
 
         // TODO: should find the position of the point within the polygon and weight each polygonpoint height based on its distance to the point
-        Some(
-            poly.vertices
-                .iter()
-                .map(|i| *heights.get(*i as usize).unwrap_or(&0.0))
-                .sum::<f32>()
-                / poly.vertices.len() as f32,
-        )
+        poly.vertices
+            .iter()
+            .map(|i| *layer.height.get(*i as usize).unwrap_or(&0.0))
+            .sum::<f32>()
+            / poly.vertices.len() as f32
     }
 
     /// Position of the point within the mesh, including its height on the Y axis.
-    ///
-    /// Returns `None` when [`Self::height`] does.
-    pub fn position_with_height(&self, mesh: &Mesh) -> Option<Vec3> {
-        self.height(mesh)
-            .map(|height| Vec3::new(self.pos.x, height, self.pos.y))
+    pub fn position_with_height(&self, mesh: &Mesh) -> Vec3 {
+        Vec3::new(self.pos.x, self.height(mesh), self.pos.y)
     }
 }
 
@@ -376,7 +298,7 @@ impl Default for Mesh {
             search_delta: 0.1,
             search_steps: 2,
             #[cfg(feature = "stats")]
-            scenarios: ScenarioCounter::default(),
+            scenarios: Cell::new(0),
         }
     }
 }
@@ -423,15 +345,6 @@ pub enum MeshError {
     /// One of the layer has too many polygons (more than 2^24-1).
     #[error("One layer has too many polygons")]
     TooManyPolygons,
-    /// The heights given for a layer don't match its vertices, so there is no way to tell which
-    /// height belongs to which vertex.
-    #[error("the layer was given {heights} heights but has {vertices} vertices")]
-    MismatchedHeights {
-        /// Number of heights given.
-        heights: usize,
-        /// Number of vertices in the layer.
-        vertices: usize,
-    },
 }
 
 impl Mesh {
@@ -482,12 +395,6 @@ impl Mesh {
     ///
     /// This will be a [`Path`] if a path is found, or `None` if not.
     ///
-    /// A point given without a polygon or a layer can sit over more than one polygon, on a
-    /// mesh whose layers or polygons overlap: a spot under a balcony is on the ground floor
-    /// and on the balcony both. Every polygon it resolves to is a valid reading of the
-    /// query, so all of them are searched together and the shortest path is returned. Give
-    /// a [`Coords`] with a layer, or use [`Self::path_3d`], to pick one instead.
-    ///
     /// This method is blocking, to get the path in an async way use [`Self::get_path`].
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
     #[inline(always)]
@@ -497,276 +404,94 @@ impl Mesh {
         to: impl Into<Coords>,
         blocked_layers: HashSet<u8>,
     ) -> Option<Path> {
-        let from = from.into();
-        let to = to.into();
-
-        let starting_polygons = self.candidate_polygons(from, &blocked_layers);
-        if starting_polygons.is_empty() {
-            return None;
-        }
-        let ending_polygons = self.candidate_polygons(to, &blocked_layers);
-        if ending_polygons.is_empty() {
-            return None;
-        }
-
-        self.path_between_polygons(
-            (from.pos, &starting_polygons),
-            (to.pos, &ending_polygons),
-            blocked_layers,
-        )
-    }
-
-    /// Compute a path between two points in 3D.
-    ///
-    /// The navigation mesh lies in the XZ plane with Y as the height. Both ends are snapped
-    /// to the closest point on the mesh, using their `y` to pick between polygons that
-    /// overlap in XZ -- a spot under a balcony is on the ground floor and on the balcony
-    /// both, and the height says which one was meant. The path is then returned following
-    /// the terrain, with points added where it crosses a change of slope.
-    ///
-    /// This is the 3D counterpart of [`Self::path`], and does in one call what
-    /// [`Self::get_closest_point_at_height`], [`Self::path`] and [`Path::path_with_height`]
-    /// do in four.
-    ///
-    /// As with [`Self::path`], the returned path does not include the starting point, and
-    /// its last point is the snapped `to` rather than `to` itself, so every point of it is
-    /// on the mesh even when the ones given are not.
-    ///
-    /// Returns `None` if either end is too far from the mesh, if there is no path between
-    /// them, or if any layer the path goes through has no height information -- there is
-    /// nothing to follow then. Only some navmesh sources carry heights: a mesh built from a
-    /// [`Triangulation`] is flat, one imported from recast gets them from its detail mesh.
-    /// See [`Layer::heights`] and [`Layer::set_heights`].
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn path_3d(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
-        let start = self.get_closest_point_at_height(from, from.y)?;
-        let end = self.get_closest_point_at_height(to, to.y)?;
-        let path = self.path(start, end)?;
-        path.path_with_height(
-            start.position_with_height(self)?,
-            end.position_with_height(self)?,
-            self,
-        )
-    }
-
-    /// Every polygon a query point resolves to.
-    ///
-    /// A point that already names its polygon has exactly one; one that names a layer is
-    /// looked for in that layer only. Otherwise it can land on several overlapping
-    /// polygons, and which of them a search picks must not depend on how the mesh is cut
-    /// into layers, so they are all returned.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    #[inline(always)]
-    pub(crate) fn candidate_polygons(
-        &self,
-        point: Coords,
-        blocked_layers: &HashSet<u8>,
-    ) -> SmallVec<[u32; 1]> {
-        if point.polygon_index != u32::MAX {
-            return smallvec::smallvec![point.polygon_index];
-        }
-        let mut found = SmallVec::new();
-        for step in 0..self.search_steps {
-            // Every layer is searched at this step before moving on to the next one:
-            // stopping at the first layer with a hit would make the answer depend on how
-            // the mesh happens to be partitioned into layers.
-            for (layer_index, layer) in self.layers.iter().enumerate() {
-                let layer_index = layer_index as u8;
-                if point.layer.is_some_and(|only| only != layer_index)
-                    || blocked_layers.contains(&layer_index)
-                {
-                    continue;
-                }
-                layer.push_point_locations(
-                    point.pos - layer.offset,
-                    self.search_delta,
-                    step,
-                    layer_index,
-                    &mut found,
-                );
-            }
-            if !found.is_empty() {
-                break;
-            }
-        }
-        if found.len() > 1 {
-            self.merge_touching_readings(&mut found);
-        }
-        found
-    }
-
-    /// Drop the readings that are not really different.
-    ///
-    /// A point that lands on an edge is in the polygons on both sides of it, and one on a
-    /// vertex is in every polygon around it. Those are neighbours, so a search that starts
-    /// in any of them reaches the rest over a zero-length crossing, and seeding from each
-    /// would walk the whole mesh once per reading. What has to be kept is a reading the
-    /// search cannot get to from another one -- a floor above, a disconnected region.
-    fn merge_touching_readings(&self, found: &mut SmallVec<[u32; 1]>) {
-        let mut kept: SmallVec<[u32; 1]> = SmallVec::new();
-        let mut group: SmallVec<[u32; 1]> = SmallVec::new();
-        while !found.is_empty() {
-            let first = found.remove(0);
-            kept.push(first);
-            group.clear();
-            group.push(first);
-            // Everything the kept reading touches, and everything those touch in turn.
-            while let Some(current) = group.pop() {
-                let mut other = 0;
-                while other < found.len() {
-                    if self.share_an_edge(current, found[other]) {
-                        group.push(found.remove(other));
-                    } else {
-                        other += 1;
-                    }
-                }
-            }
-        }
-        *found = kept;
-    }
-
-    /// Is there an edge of `polygon` that `other` is on the other side of?
-    fn share_an_edge(&self, polygon: u32, other: u32) -> bool {
-        let layer = &self.layers[polygon.layer() as usize];
-        layer.polygons[polygon.polygon() as usize]
-            .edges_index()
-            .any(|[edge0, edge1]| {
-                let (Some(start), Some(end)) = (
-                    layer.vertices.get(edge0 as usize),
-                    layer.vertices.get(edge1 as usize),
-                ) else {
-                    return false;
-                };
-                start.polygons.contains(&other) && end.polygons.contains(&other)
-            })
-    }
-
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    fn path_between_polygons(
-        &self,
-        from: (Vec2, &[u32]),
-        to: (Vec2, &[u32]),
-        blocked_layers: HashSet<u8>,
-    ) -> Option<Path> {
         #[cfg(feature = "stats")]
         let start = Instant::now();
 
-        let (from_point, starting_polygons) = from;
-        let (to_point, ending_polygons) = to;
+        let from = from.into();
+        let to = to.into();
 
+        let starting_polygon_index = if from.polygon_index != u32::MAX {
+            from.polygon_index
+        } else {
+            self.get_closest_point_on_layers(from, blocked_layers.clone())?
+                .polygon_index
+        };
+        let ending_polygon = if to.polygon_index != u32::MAX {
+            to.polygon_index
+        } else {
+            self.get_closest_point_on_layers(to, blocked_layers.clone())?
+                .polygon_index
+        };
         // TODO: fix islands detection with multiple layers, even if start and end are on the same layer
         if self.layers.len() == 1 {
-            if let Some(islands) = self.layers[0].islands.as_ref() {
-                let connected = starting_polygons.iter().any(|starting_polygon| {
-                    ending_polygons.iter().any(|ending_polygon| {
-                        let start_island = islands.get(starting_polygon.polygon() as usize);
-                        let end_island = islands.get(ending_polygon.polygon() as usize);
-                        start_island.is_none() || end_island.is_none() || start_island == end_island
-                    })
-                });
-                if !connected {
+            if let Some(islands) = self.layers[starting_polygon_index.layer() as usize]
+                .islands
+                .as_ref()
+            {
+                let start_island = islands.get(starting_polygon_index.polygon() as usize);
+                let end_island = islands.get(ending_polygon.polygon() as usize);
+                if start_island.is_some() && end_island.is_some() && start_island != end_island {
                     return None;
                 }
             }
         }
 
-        // A point that starts in a goal polygon is already there, and nothing beats a
-        // straight line, so there is no need to look at the other candidates.
-        if let Some(ending_polygon) = starting_polygons
-            .iter()
-            .find(|starting_polygon| ending_polygons.contains(starting_polygon))
-        {
+        if starting_polygon_index == ending_polygon {
             #[cfg(feature = "stats")]
             {
+                if self.scenarios.get() == 0 {
+                    eprintln!(
+                    "index;micros;successor_calls;generated;pushed;popped;pruned_post_pop;length",
+                );
+                }
                 eprintln!(
                     "{};{};0;0;0;0;0;{}",
-                    self.scenarios.next(),
+                    self.scenarios.get(),
                     start.elapsed().as_secs_f32() * 1_000_000.0,
-                    from_point.distance(to_point),
+                    from.pos.distance(to.pos),
                 );
+                self.scenarios.set(self.scenarios.get() + 1);
             }
             return Some(Path {
-                length: from_point.distance(to_point),
-                path: vec![to_point],
+                length: from.pos.distance(to.pos),
+                path: vec![to.pos],
                 #[cfg(feature = "detailed-layers")]
-                path_with_layers: vec![(to_point, ending_polygon.layer())],
-                path_through_polygons: vec![*ending_polygon],
+                path_with_layers: vec![(to.pos, ending_polygon.layer())],
+                path_through_polygons: vec![ending_polygon],
             });
         }
 
         let mut search_instance = SearchInstance::setup(
             self,
-            (from_point, starting_polygons),
-            (to_point, ending_polygons),
+            (from.pos, starting_polygon_index),
+            (to.pos, ending_polygon),
             blocked_layers,
             #[cfg(feature = "stats")]
             start,
         );
 
+        let mut paths: Vec<Path> = vec![];
         // Limit search to avoid an infinite loop.
-        let iterations = self.layers.iter().map(|l| l.polygons.len()).sum::<usize>() * 10;
-
-        // A path reaches the goal while its `heuristic` still covers the last leg, so the
-        // `f` it was popped with is a lower bound on its cost rather than the cost itself.
-        // With every layer at the same scale the two are equal and the first path found is
-        // returned immediately, exactly as the default build does. When they differ, a
-        // cheaper path can still be queued behind it -- but only one whose `f` is below
-        // what has been found, and `f` never overestimates, so the search stops as soon as
-        // the queue cannot beat it. That is a handful of extra pops, against the full
-        // enumeration of the mesh this used to do.
+        for _ in 0..self.layers.iter().map(|l| l.polygons.len()).sum::<usize>() * 10 {
+            match search_instance.next() {
+                #[cfg(not(feature = "detailed-layers"))]
+                InstanceStep::Found(path) => return Some(path),
+                #[cfg(feature = "detailed-layers")]
+                InstanceStep::Found(path) => paths.push(path),
+                // The queue has run dry and nothing can refill it, so every further step
+                // is a pop from an empty heap. Keep going and we just burn the whole
+                // iteration limit before returning the answer we already have.
+                InstanceStep::NotFound => break,
+                InstanceStep::Continue => (),
+            }
+        }
         #[cfg(feature = "detailed-layers")]
-        {
-            let mut best: Option<Path> = None;
-            for _ in 0..iterations {
-                match search_instance.next() {
-                    InstanceStep::Found(path) => {
-                        if best.as_ref().is_none_or(|best| path.length < best.length) {
-                            best = Some(path);
-                        }
-                    }
-                    // The queue has run dry and nothing can refill it, so every further
-                    // step is a pop from an empty heap.
-                    InstanceStep::NotFound => break,
-                    InstanceStep::Continue => (),
-                }
-                if let Some(best) = &best {
-                    match search_instance.queued_lower_bound() {
-                        Some(bound) if bound < best.length => (),
-                        _ => break,
-                    }
-                }
-            }
-            best
-        }
-
-        #[cfg(not(feature = "detailed-layers"))]
-        {
-            for _ in 0..iterations {
-                match search_instance.next() {
-                    // Nothing left in the queue can beat the node that just came off it,
-                    // so the first path to the goal is the shortest one.
-                    InstanceStep::Found(path) => return Some(path),
-                    InstanceStep::NotFound => break,
-                    InstanceStep::Continue => (),
-                }
-            }
+        paths.sort_unstable_by(|p1, p2| p1.length.partial_cmp(&p2.length).unwrap());
+        if paths.is_empty() {
             None
+        } else {
+            Some(paths.remove(0))
         }
-    }
-
-    /// The cheapest a unit of travel can be anywhere on this mesh: the smallest component
-    /// of any layer's [`Layer::scale`].
-    ///
-    /// Measuring the heuristic at this rate is what keeps it from overestimating, whatever
-    /// layers the path ends up crossing. Recomputed per query rather than baked, because
-    /// `scale` is a public field callers are free to change after the mesh is built.
-    #[cfg(feature = "detailed-layers")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "detailed-layers")))]
-    pub(crate) fn min_scale(&self) -> f32 {
-        self.layers
-            .iter()
-            .map(|layer| layer.scale.x.min(layer.scale.y))
-            .fold(f32::INFINITY, f32::min)
     }
 
     /// The delta set by [`Mesh::set_delta`]
@@ -820,11 +545,9 @@ impl Mesh {
             from: (node.root, 0),
             to,
             polygon_to: self.get_point_location(to),
-            other_polygons_to: Vec::new(),
+            polygon_from: 0,
             mesh: self,
             blocked_layers: HashSet::default(),
-            #[cfg(feature = "detailed-layers")]
-            min_scale: self.min_scale(),
             #[cfg(feature = "stats")]
             pushed: 0,
             #[cfg(feature = "stats")]
@@ -867,11 +590,9 @@ impl Mesh {
             from: (Vec2::ZERO, 0),
             to: Vec2::ZERO,
             polygon_to: self.get_point_location(vec2(0.0, 0.0)),
-            other_polygons_to: Vec::new(),
+            polygon_from: self.get_point_location(vec2(0.0, 0.0)),
             mesh: self,
             blocked_layers: HashSet::default(),
-            #[cfg(feature = "detailed-layers")]
-            min_scale: self.min_scale(),
             #[cfg(feature = "stats")]
             pushed: 0,
             #[cfg(feature = "stats")]
@@ -1055,11 +776,10 @@ impl Mesh {
         blocked_layers: HashSet<u8>,
         height: f32,
     ) -> Option<Coords> {
-        let candidates = self.get_closest_points_on_layers(point, blocked_layers);
-        candidates
+        self.get_closest_points_on_layers(point, blocked_layers)
             .iter()
-            .filter_map(|coord| coord.height(self).map(|height| (*coord, height)))
-            .fold(None, |acc: Option<(Coords, f32)>, (coord, coord_height)| {
+            .fold(None, |acc: Option<(Coords, f32)>, &coord| {
+                let coord_height = coord.height(self);
                 if acc
                     .map(|(_, closest_height)| (closest_height - height).abs())
                     .unwrap_or(f32::MAX)
@@ -1071,9 +791,6 @@ impl Mesh {
                 }
             })
             .map(|acc| acc.0)
-            // Nothing that was found has a height to discriminate on, so every candidate is as
-            // good as the next one.
-            .or_else(|| candidates.first().copied())
     }
 
     /// Find the closest point in the mesh
@@ -1106,34 +823,27 @@ impl Mesh {
             }
         } else {
             for step in 0..self.search_steps {
-                // Every layer is searched at this step before moving on to the next one:
-                // stopping at the first layer with a hit would make the answer depend on
-                // how the mesh happens to be partitioned into layers.
-                let coords: Vec<Coords> = self
+                for (layer_index, layer) in self
                     .layers
                     .iter()
                     .enumerate()
                     .filter(|(index, _)| !blocked_layers.contains(&(*index as u8)))
-                    .flat_map(|(layer_index, layer)| {
-                        layer
-                            .get_closest_points_inner(
-                                point.pos - layer.offset,
-                                self.search_delta,
-                                step,
-                            )
-                            .into_iter()
-                            .map(move |(new_point, polygon)| Coords {
-                                pos: new_point + layer.offset,
-                                layer: Some(layer_index as u8),
-                                polygon_index: U32Layer::from_layer_and_polygon(
-                                    layer_index as u8,
-                                    polygon,
-                                ),
-                            })
-                    })
-                    .collect();
-                if !coords.is_empty() {
-                    return coords;
+                {
+                    let coords: Vec<Coords> = layer
+                        .get_closest_points_inner(point.pos - layer.offset, self.search_delta, step)
+                        .iter()
+                        .map(|(new_point, polygon)| Coords {
+                            pos: new_point + layer.offset,
+                            layer: Some(layer_index as u8),
+                            polygon_index: U32Layer::from_layer_and_polygon(
+                                layer_index as u8,
+                                *polygon,
+                            ),
+                        })
+                        .collect();
+                    if !coords.is_empty() {
+                        return coords;
+                    }
                 }
             }
         }
@@ -1194,11 +904,10 @@ pub(crate) struct PathArenaNode {
     polygon: u32,
     parent: u32, // u32::MAX = no parent
     root_changed: bool,
-    /// The edge this node was reached over, used to place the point at which the path
-    /// crosses into `polygon`'s layer. Both layers are read back off `polygon` and the
-    /// previous entry's, so neither is stored.
     #[cfg(feature = "detailed-layers")]
-    interval: (Vec2, Vec2),
+    root_layer_info: Option<(Vec2, Vec2, u8)>,
+    #[cfg(feature = "detailed-layers")]
+    crossing_layer_info: Option<(Vec2, Vec2, u8)>,
 }
 
 #[derive(PartialEq, Debug)]
